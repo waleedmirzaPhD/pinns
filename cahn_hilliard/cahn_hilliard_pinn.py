@@ -49,8 +49,14 @@ torch.set_default_dtype(torch.float64)
 EPS = 0.05        # ε — interface width parameter in the Cahn-Hilliard equation.
                   # Smaller ε → sharper phase boundaries → harder to train.
 
-N_F = 10_000      # Number of PDE collocation points scattered randomly in (x,t)
-                  # space. More points → better PDE coverage → slower per-step.
+T_END = 10.0      # End time of the simulation window.
+                  # t ∈ [0, T_END]. Extending to 10 allows the system to move
+                  # through spinodal decomposition AND significant coarsening,
+                  # approaching a steady state of fully separated ±1 phases.
+
+N_F = 30_000      # Number of PDE collocation points scattered randomly in (x,t).
+                  # Increased from 10,000 to 30,000 to maintain adequate coverage
+                  # over the 10× larger time domain [0, T_END].
 
 N_IC = 2_000      # Number of points used to enforce the initial condition c(x,0).
                   # These live on the t=0 line only.
@@ -160,11 +166,16 @@ class FourierEmbedding1D(nn.Module):
         sin_feats = torch.sin(kx)  # shape: (N, K)
         cos_feats = torch.cos(kx)  # shape: (N, K)
 
-        # Concatenate [sin features | cos features | t] along the feature axis (dim=1).
-        # t is appended last and is NOT embedded — it is passed through unchanged.
-        # Time does not need periodicity, so raw t is fine.
+        # Normalise t to [0, 1] before appending.
+        # Raw t lives in [0, T_END=10] while all sin/cos features live in [-1, 1].
+        # Passing raw t would give the first MLP layer a 10× scale mismatch on the
+        # time channel, which makes Xavier-initialised weights badly calibrated and
+        # degrades both the IC fit (t=0 regime) and L-BFGS gradient quality.
+        # Dividing by T_END maps t → [0, 1] so all input features share the same
+        # scale.  PyTorch autograd traces through this division, so ∂c/∂t is still
+        # computed correctly (as (1/T_END)·∂c/∂t_norm) without any manual adjustment.
         # Final shape: (N, K + K + 1) = (N, 2K+1) = (N, 33) for K=16
-        features = torch.cat([sin_feats, cos_feats, t], dim=1)
+        features = torch.cat([sin_feats, cos_feats, t / T_END], dim=1)
 
         return features   # shape (N, 33)
 
@@ -537,7 +548,10 @@ def sample_points(N_f: int, N_ic: int, device: str):
     # requires_grad=True is set directly at creation — this is more efficient
     # than creating the tensor first and then calling .requires_grad_(True).
     x_f = torch.rand(N_f,  1, dtype=torch.float64, device=device, requires_grad=True)
-    t_f = torch.rand(N_f,  1, dtype=torch.float64, device=device, requires_grad=True)
+    # Scale t_f to Uniform[0, T_END) BEFORE enabling requires_grad.
+    # Doing the multiplication after requires_grad=True would create an extra
+    # graph node that causes "backward through graph twice" errors.
+    t_f = (torch.rand(N_f, 1, dtype=torch.float64, device=device) * T_END).requires_grad_(True)
 
     # Sample IC x-coordinates directly on device using torch.rand.
     # Previously this used np.random.uniform + torch.tensor(), which created
@@ -646,8 +660,10 @@ def train(model: PINN, device: str):
     # Phase 1: Adam
     # -----------------------------------------------------------------------
     print("=" * 60)
-    print("Phase 1: Adam optimiser (4,000 steps)")
+    print("Phase 1: Adam optimiser (10,000 steps)")
     print("=" * 60)
+
+    model.train()
 
     # Adam (Adaptive Moment Estimation) maintains per-parameter running estimates
     # of the first and second moments of the gradient, enabling an adaptive
@@ -726,6 +742,8 @@ def train(model: PINN, device: str):
     # pool.  empty_cache() returns it to the OS / driver, which can reduce
     # fragmentation and give L-BFGS (which retains 100 past gradient vectors)
     # a clean pool to allocate from.  On CPU this is a no-op.
+    model.train()
+
     if device == 'cuda':
         torch.cuda.empty_cache()
 
@@ -737,18 +755,25 @@ def train(model: PINN, device: str):
     x_f, t_f, x_ic, t_ic, c_ic = sample_points(N_F, N_IC, device)
 
     # Instantiate the L-BFGS optimiser.
-    #   max_iter:        Maximum number of optimisation iterations.
-    #   tolerance_grad:  Stop when gradient norm < 1e-9.
-    #   tolerance_change: Stop when change in loss < 1e-12 (extremely tight).
+    #   max_iter=1:      ONE update step per .step() call. The outer loop below
+    #                    controls how many total L-BFGS steps are taken.
+    #                    Setting max_iter > 1 here would cause all iterations to
+    #                    run inside the FIRST .step() call, leaving every
+    #                    subsequent call a no-op (frozen losses).
+    #   tolerance_grad=0, tolerance_change=0:
+    #                    Disable early-stopping thresholds so the outer loop —
+    #                    not an internal convergence check — decides when to stop.
     #   history_size:    Number of past gradient/step pairs kept for the
     #                    Hessian approximation. 100 gives very accurate curvature.
     #   line_search_fn:  'strong_wolfe' ensures the Armijo and curvature
-    #                    conditions are satisfied, giving robust convergence.
+    #                    conditions are satisfied per step, giving robust convergence.
+    N_LBFGS = 10_000   # Total number of L-BFGS update steps (matches original max_iter intent)
+
     optimizer_lbfgs = torch.optim.LBFGS(
         model.parameters(),
-        max_iter=20_000,
-        tolerance_grad=1e-9,
-        tolerance_change=1e-12,
+        max_iter=1,
+        tolerance_grad=0,
+        tolerance_change=0,
         history_size=100,
         line_search_fn='strong_wolfe',
     )
@@ -759,11 +784,12 @@ def train(model: PINN, device: str):
     #   2. Re-compute the loss (forward pass)
     #   3. Call .backward() on the loss
     #   4. Return the scalar loss value
-    # L-BFGS calls the closure multiple times per step (for line search).
+    # With strong_wolfe line search, L-BFGS calls the closure 2–4× per step
+    # to satisfy the Wolfe conditions. That is expected and correct behaviour.
 
-    # Use a mutable list [0] as a counter because Python closures cannot
-    # rebind a bare integer variable from the enclosing scope (only read it).
-    lbfgs_step = [0]
+    # A mutable list captures the losses from the most recent closure call so
+    # the outer loop can log them after .step() returns.
+    last_losses = [None, None, None]   # [L_total, L_pde, L_ic] as Python floats
 
     def closure():
         # Step 1: zero gradients
@@ -775,45 +801,34 @@ def train(model: PINN, device: str):
         # Step 3: backward pass — compute gradients w.r.t. all parameters
         L_total.backward()
 
-        # Increment the iteration counter stored in the mutable list.
-        lbfgs_step[0] += 1
-
-        # Log every 500 closure calls.
-        # NOTE: lbfgs_step[0] counts CLOSURE CALLS, not true L-BFGS iterations.
-        # L-BFGS calls the closure multiple times per iteration during line search,
-        # so the closure count is typically 2–4× the iteration count.
-        if lbfgs_step[0] % 500 == 0:
-            lt = L_total.item()
-            lp = L_pde.item()
-            li = L_ic.item()
-
-            # Offset step count by 10,000 so history is contiguous with Phase 1.
-            history['step'].append(10_000 + lbfgs_step[0])
-            history['total'].append(lt)
-            history['pde'].append(lp)
-            history['ic'].append(li)
-
-            print(f"  L-BFGS closure {lbfgs_step[0]:6d} | L_total={lt:.3e} | "
-                  f"L_pde={lp:.3e} | L_ic={li:.3e}")
+        # Capture scalar values for logging after .step() returns.
+        # .item() detaches from the graph; safe to call inside the closure.
+        last_losses[0] = L_total.item()
+        last_losses[1] = L_pde.item()
+        last_losses[2] = L_ic.item()
 
         # Step 4: return the loss so L-BFGS can use it for line-search decisions.
         return L_total
 
-    # Run the optimiser. Internally it calls closure() many times,
-    # each time evaluating the loss, computing gradients, and deciding
-    # on a step direction and step length using the strong Wolfe conditions.
-    optimizer_lbfgs.step(closure)
+    # Outer loop: each iteration performs exactly one L-BFGS update step.
+    # Progress is logged every 500 steps (same cadence as the Adam phase).
+    for refine_step in range(1, N_LBFGS + 1):
+        optimizer_lbfgs.step(closure)
 
-    # --- Final loss evaluation ---
-    # NOTE: torch.no_grad() cannot be used here. pde_residual() calls
-    # torch.autograd.grad() internally, which requires a computation graph
-    # to exist. Under no_grad(), the forward pass builds no graph (c has no
-    # grad_fn), so autograd.grad() would raise a RuntimeError.
-    # We accept the small overhead of a full forward+grad pass just for this
-    # one diagnostic print.
-    L_total, L_pde, L_ic = compute_losses(model, x_f, t_f, x_ic, t_ic, c_ic)
-    print(f"\nFinal | L_total={L_total.item():.3e} | "
-          f"L_pde={L_pde.item():.3e} | L_ic={L_ic.item():.3e}")
+        if refine_step % 500 == 0:
+            lt, lp, li = last_losses
+
+            # Offset by Adam steps so the history x-axis is contiguous.
+            history['step'].append(10_000 + refine_step)
+            history['total'].append(lt)
+            history['pde'].append(lp)
+            history['ic'].append(li)
+
+            print(f"  Refine {refine_step:6d}/{N_LBFGS} | "
+                  f"L_total={lt:.3e} | L_pde={lp:.3e} | L_ic={li:.3e}")
+
+    lt, lp, li = last_losses
+    print(f"\nFinal | L_total={lt:.3e} | L_pde={lp:.3e} | L_ic={li:.3e}")
 
     return history   # Return the recorded loss values for plotting
 
@@ -841,7 +856,7 @@ def evaluate_and_plot(model: PINN, device: str):
     # trapezoidal mass integral (which would double-count one point).
     # Time is NOT periodic, so t_grid keeps endpoint=True (default).
     x_grid = np.linspace(0, 1, N_x, endpoint=False)  # shape (512,): x = 0, 1/512, ..., 511/512
-    t_grid = np.linspace(0, 1, N_t)                   # shape (200,): t = 0, 1/199, ..., 1
+    t_grid = np.linspace(0, T_END, N_t)                   # shape (200,): t = 0, 1/199, ..., 1
 
     # Build a 2-D meshgrid with 'ij' indexing so that:
     #   XX[i, j] = x_grid[i]  (x varies along axis 0)
@@ -890,7 +905,7 @@ def evaluate_and_plot(model: PINN, device: str):
     print("=" * 60)
 
     # Five snapshot times at which we will check the total mass.
-    snap_times = [0.0, 0.25, 0.5, 0.75, 1.0]
+    snap_times = [0.0, T_END * 0.1, T_END * 0.25, T_END * 0.5, T_END * 0.75, T_END]
     masses = []
 
     for t_star in snap_times:
@@ -1002,7 +1017,7 @@ def plot_with_history(model: PINN, device: str, history: dict):
     # in plots and double-count one point in the trapezoidal mass integral.
     # Time is not periodic so t_grid keeps the default endpoint=True.
     x_grid = np.linspace(0, 1, N_x, endpoint=False)  # 512 points: 0, 1/512, ..., 511/512
-    t_grid = np.linspace(0, 1, N_t)                   # 200 snapshots: 0, ..., 1
+    t_grid = np.linspace(0, T_END, N_t)                   # 200 snapshots: 0, ..., 1
 
     # Construct a 2-D meshgrid (ij indexing: first index = x, second = t).
     XX, TT = np.meshgrid(x_grid, t_grid, indexing='ij')   # both (512, 200)
@@ -1038,7 +1053,7 @@ def plot_with_history(model: PINN, device: str, history: dict):
     print("Mass Conservation Check")
     print("=" * 60)
 
-    snap_times = [0.0, 0.25, 0.5, 0.75, 1.0]   # Diagnostic snapshot times
+    snap_times = [0.0, T_END * 0.1, T_END * 0.25, T_END * 0.5, T_END * 0.75, T_END]   # Diagnostic snapshot times
     masses = []
 
     for t_star in snap_times:
@@ -1158,7 +1173,9 @@ def main():
     print(f"N_f = {N_F},  N_ic = {N_IC}\n")
 
     # Instantiate the PINN and move all parameters and buffers to the chosen device.
-    model = PINN(K=16, hidden_layers=5, hidden_dim=64).to(device)
+    # Wider network (128 hidden units) to handle the richer dynamics over [0, T_END].
+    # The longer time window requires more representational capacity.
+    model = PINN(K=16, hidden_layers=5, hidden_dim=128).to(device)
 
     # Count and display the total number of trainable parameters.
     # sum(...) iterates over all parameter tensors; .numel() returns element count.
