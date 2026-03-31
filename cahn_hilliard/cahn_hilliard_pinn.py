@@ -496,10 +496,10 @@ def ic_function(x, seed: int = 42):
 
     where a_k, b_k ~ U(-1, 1) drawn with a fixed seed for reproducibility.
 
-    After summing, the profile is normalised so that max|c(x,0)| = 0.05.
-    This small amplitude keeps the initial condition well within the linear
-    (early-time) regime of spinodal decomposition, making the problem easier
-    to learn while still triggering phase separation at later times.
+    After summing, the profile is normalised so that max|c(x,0)| = IC_AMPLITUDE.
+    The amplitude is chosen to sit inside the spinodal region (IC_AMPLITUDE < 1/√3)
+    while being large enough that phase separation onset t* ≈ ln(1/A)/σ_max is
+    short enough for the quadratic temporal sampler to cover it adequately.
 
     Why only k=1,2,3 (no k=0 constant mode)?
     ──────────────────────────────────────────
@@ -1264,7 +1264,8 @@ def main():
     # Print a configuration summary for reference.
     print(f"Device: {device}")
     print(f"PyTorch dtype: float64")
-    print(f"ε = {EPS},  λ_pde = {LAMBDA_PDE},  λ_ic = {LAMBDA_IC}")
+    print(f"ε = {EPS},  IC_amplitude = {IC_AMPLITUDE}  [spinodal if < {1/3**0.5:.3f}]")
+    print(f"λ_pde = {LAMBDA_PDE},  λ_ic = {LAMBDA_IC}")
     print(f"N_f = {N_F},  N_ic = {N_IC}\n")
 
     # Instantiate the PINN and move all parameters and buffers to the chosen device.
