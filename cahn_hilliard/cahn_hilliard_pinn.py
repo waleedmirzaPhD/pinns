@@ -73,6 +73,27 @@ LAMBDA_IC = 100.0 # Weight (λ_ic) for the initial-condition loss term.
                   # so this weight has no practical effect but is kept for diagnostics.
 
 # --------------------------------------------------------------------------
+# Causal training parameter
+# --------------------------------------------------------------------------
+# Cahn-Hilliard has explosive dynamics near t=0 (growth rate σ_max ≈ 96) and
+# nearly frozen dynamics at t > 0.5.  Without causal weighting the optimiser
+# can accidentally minimise the late-time loss (trivially easy: c ≈ ±1 is a
+# fixed point) while ignoring the rapid early-time phase separation.
+#
+# Causal training (Wang et al. 2022) weights each PDE collocation point by
+#   w_i = exp(−CAUSAL_EPS · Σ_{j: t_j < t_i} R_j²·Δt_j)
+# so a point at time t only receives full gradient signal once all earlier
+# times are already well-satisfied.  As training progresses and R → 0 at
+# early times, the weights for later times automatically increase.
+#
+# CAUSAL_EPS controls how strictly causality is enforced:
+#   Small (1e-1): soft — all times trained roughly equally (→ standard PINN)
+#   Large (1e3):  hard — network must fully solve t≈0 before moving to t>0
+# A value of 1e2 works well for σ_max ≈ 96; tune upward if early dynamics
+# still look wrong, downward if training stalls.
+CAUSAL_EPS = 1e2  # causal weighting strength ε in exp(−ε · cumulative R²)
+
+# --------------------------------------------------------------------------
 # Parametric regime for phase separation
 # --------------------------------------------------------------------------
 # The Cahn-Hilliard equation ∂c/∂t = ∇²[c³ - c - ε²∇²c] undergoes spinodal
@@ -698,14 +719,52 @@ def compute_losses(model, x_f, t_f, x_ic, t_ic, c_exact_ic):
     Returns:
         (L_total, L_pde, L_ic) — all scalar tensors, attached to the graph.
     """
-    # --- PDE loss ---
+    # --- PDE loss with causal weighting ---
     # Compute the residual R at every collocation point.
     # R should be zero if the network perfectly satisfies the Cahn-Hilliard equation.
     R = pde_residual(model, x_f, t_f)      # shape (N_f, 1)
 
-    # Mean squared residual: L_pde = (1/N_f) Σ R_i²
-    # Squaring makes the loss non-negative and penalises large violations more strongly.
-    L_pde = torch.mean(R**2)               # scalar
+    # Causal training (Wang et al. 2022):
+    # Weight each collocation point so that time t only receives full gradient
+    # signal once all earlier times t′ < t are already well-satisfied.
+    #
+    # Algorithm:
+    #   1. Sort points by time t.
+    #   2. Compute the cumulative mean of R² from t=0 up to (but not including)
+    #      each point — this is the "cost so far" from earlier times.
+    #   3. Weight = exp(−CAUSAL_EPS · cumulative_cost).
+    #      At the start of training R² is large at early t → weights for
+    #      large t are near 0 (network ignores them).  As R→0 at early t,
+    #      the cumulative cost shrinks → later times become active.
+    #
+    # Implementation note:
+    #   We sort, compute an *exclusive* cumsum (shifted by one), then unsort.
+    #   The division by N_f normalises so that the cumulative cost is
+    #   comparable across different batch sizes.
+
+    t_flat  = t_f.squeeze()                        # (N_f,)
+    R_flat  = R.squeeze()                          # (N_f,)
+    N_f     = t_flat.shape[0]
+
+    sort_idx            = torch.argsort(t_flat)    # indices that sort t ascending
+    R_sorted            = R_flat[sort_idx]         # R values in time order
+
+    # Exclusive cumulative mean of R²: cum[i] = mean(R²[0..i-1])
+    # We use cumsum and shift by one position so point i only "sees" its past.
+    cumR2               = torch.cumsum(R_sorted**2, dim=0) / N_f  # inclusive
+    cumR2_excl          = torch.zeros_like(cumR2)
+    cumR2_excl[1:]      = cumR2[:-1]               # shift right → exclusive
+
+    causal_w_sorted     = torch.exp(-CAUSAL_EPS * cumR2_excl)  # (N_f,) weights in sorted order
+
+    # Unsort: map weights back to the original (unsorted) point order.
+    unsort_idx          = torch.argsort(sort_idx)
+    causal_w            = causal_w_sorted[unsort_idx]          # (N_f,) weights in original order
+
+    # Weighted PDE loss.  detach() the weights so their gradients do not
+    # flow back through the cumsum — we treat them as fixed multipliers, not
+    # as part of the optimisation target (standard practice in causal PINNs).
+    L_pde = torch.mean(causal_w.detach() * R_flat**2)          # scalar
 
     # --- IC loss ---
     # Ask the network what it predicts at the initial time for the IC x-locations.
@@ -777,14 +836,42 @@ def train(model: PINN, device: str):
 
     for step in range(1, 30_001):   # steps 1 through 30,000 inclusive
 
-        # Re-draw collocation points every 1,000 steps.
-        # This is a form of Monte Carlo integration over (x,t) space —
-        # periodically refreshing the points prevents the network from
-        # memorising a specific fixed point set (reduces overfitting to grid).
-        # Condition: step % 1000 == 1 triggers at steps 1, 1001, 2001, ...
-        # The first sample happens here at step=1, so no pre-loop sample is needed.
-        if step % 1_000 == 1:
+        # --- Full resample every 2,000 steps ---
+        # Draws a completely fresh batch of collocation points with quadratic
+        # time bias.  Full resampling every 2k (vs 1k before) is cheaper since
+        # the RAR top-up below already refreshes the hardest points every 500.
+        if step % 2_000 == 1:
             x_f, t_f, x_ic, t_ic, c_ic = sample_points(N_F, N_IC, device)
+
+        # --- Residual-Adaptive Resampling (RAR) every 500 steps ---
+        # Replace the 10% of collocation points with the largest current |R|
+        # with fresh uniform samples.  This concentrates training effort on the
+        # regions where the network is currently worst, complementing the
+        # causal weighting (which handles the time-ordering of errors).
+        #
+        # Why detach before computing R_rar?
+        #   We only need the residual VALUES to decide which points to replace —
+        #   we do NOT want gradients flowing through this selection step.
+        #   torch.no_grad() avoids building a graph and keeps memory low.
+        if step % 500 == 0 and step > 1:
+            with torch.no_grad():
+                R_rar = pde_residual(model, x_f, t_f).squeeze().abs()  # (N_f,)
+            n_replace = N_F // 10   # replace worst 10 %
+            # Indices of the n_replace points with the highest |R|
+            _, worst_idx = torch.topk(R_rar, n_replace)
+            # Boolean mask: True = keep, False = replace
+            keep_mask = torch.ones(N_F, dtype=torch.bool, device=device)
+            keep_mask[worst_idx] = False          # O(N_F), no Python loop
+            # Draw replacement points (quadratic time bias, same as sample_points)
+            x_new = torch.rand(n_replace, 1, dtype=torch.float64, device=device)
+            u_new = torch.rand(n_replace, 1, dtype=torch.float64, device=device)
+            t_new = (u_new**2 * T_END)
+            # Splice: keep the surviving points, append fresh replacements,
+            # then re-attach requires_grad on the combined leaf tensors.
+            x_f = torch.cat([x_f[keep_mask].detach(), x_new], dim=0
+                            ).requires_grad_(True)
+            t_f = torch.cat([t_f[keep_mask].detach(), t_new], dim=0
+                            ).requires_grad_(True)
 
         # Zero all accumulated gradients from the previous step.
         # PyTorch accumulates gradients by default; we must reset each step.
@@ -1274,8 +1361,10 @@ def main():
     # Print a configuration summary for reference.
     print(f"Device: {device}")
     print(f"PyTorch dtype: float64")
-    print(f"ε = {EPS},  IC_amplitude = {IC_AMPLITUDE}  [spinodal if < {1/3**0.5:.3f}]")
+    print(f"ε = {EPS},  T_END = {T_END}")
+    print(f"IC_amplitude = {IC_AMPLITUDE}  [spinodal if < {1/3**0.5:.3f}]")
     print(f"λ_pde = {LAMBDA_PDE},  λ_ic = {LAMBDA_IC}")
+    print(f"Causal training: CAUSAL_EPS = {CAUSAL_EPS}")
     print(f"N_f = {N_F},  N_ic = {N_IC}\n")
 
     # Instantiate the PINN and move all parameters and buffers to the chosen device.
