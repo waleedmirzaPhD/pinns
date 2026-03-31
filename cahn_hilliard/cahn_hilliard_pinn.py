@@ -65,9 +65,31 @@ LAMBDA_PDE = 1.0  # Weight (λ_pde) for the PDE loss term in the total loss.
                   # Kept at 1 — the reference scale; other weights are relative to it.
 
 LAMBDA_IC = 100.0 # Weight (λ_ic) for the initial-condition loss term.
-                  # Set 100× higher than λ_pde so the network first learns to match
-                  # the IC before trying to satisfy the PDE dynamics.
-                  # If the solution collapses to c≈0 everywhere, raise this to 1000.
+                  # With the hard output transform c = c_ic(x) + t·h(x,t), the IC
+                  # is satisfied exactly by construction and L_ic ≈ 0 at all times,
+                  # so this weight has no practical effect but is kept for diagnostics.
+
+# --------------------------------------------------------------------------
+# Parametric regime for phase separation
+# --------------------------------------------------------------------------
+# The Cahn-Hilliard equation ∂c/∂t = ∇²[c³ - c - ε²∇²c] undergoes spinodal
+# decomposition when the mean concentration |c̄| < 1/√3 ≈ 0.577.
+#
+# Our IC has c̄ = 0 (sum of zero-mean Fourier modes) — the most unstable
+# point of the double-well potential.  Any non-zero perturbation grows.
+#
+# Linear growth rate for wavenumber k on a [0,1] periodic domain:
+#   σ(k) = (2πk)² · [1 − ε²(2πk)²]
+#   σ(1) ≈ 35.6,   σ(2) ≈ 95.6,   σ(3) ≈ 39.7   (all positive → all unstable)
+#
+# Phase separation becomes visible when the amplitude reaches O(1), which
+# happens at  t* ≈ ln(1 / IC_AMPLITUDE) / σ_max  ≈ ln(1/0.4) / 95.6 ≈ 0.010.
+# With amplitude 0.05 this was t* ≈ 0.031 — a tiny window that uniform
+# sampling over [0, 10] almost never hits.  Increasing to 0.4 moves t* to
+# ~0.010 and makes the early-time dynamics much easier for the PINN to learn.
+IC_AMPLITUDE = 0.4  # Peak amplitude of the initial condition.
+                    # Must satisfy IC_AMPLITUDE < 1/√3 ≈ 0.577 to stay in the
+                    # spinodal region; values 0.3–0.5 give clear phase separation.
 
 # --------------------------------------------------------------------------
 # GPU scaling guide
@@ -277,7 +299,7 @@ class PINN(nn.Module):
             c_fine += a[k-1] * np.cos(2*np.pi*k*x_fine) \
                     + b[k-1] * np.sin(2*np.pi*k*x_fine)
         den   = np.max(np.abs(c_fine))
-        scale = 0.05 / den if den > 0 else 0.05   # normalise peak to 0.05
+        scale = IC_AMPLITUDE / den if den > 0 else IC_AMPLITUDE   # normalise peak to IC_AMPLITUDE
 
         # Store as non-trainable buffers so they travel with the model to any device.
         self.register_buffer('_ic_a', torch.tensor(a * scale, dtype=torch.float64))
@@ -540,7 +562,7 @@ def ic_function(x, seed: int = 42):
         # 0-dim tensor directly in an `if` implicitly calls __bool__(), which
         # works but is less explicit and triggers a GPU→CPU sync on CUDA.
         if den.item() > 0:
-            c = c / den * 0.05
+            c = c / den * IC_AMPLITUDE
 
         return c   # (N, 1) float64 tensor, same device as x
 
@@ -564,7 +586,7 @@ def ic_function(x, seed: int = 42):
         # Guard against the astronomically unlikely zero-profile case.
         den = np.max(np.abs(c))
         if den > 0:
-            c = c / den * 0.05
+            c = c / den * IC_AMPLITUDE
 
         return c.reshape(-1, 1)   # (N, 1) numpy array
 
@@ -615,10 +637,16 @@ def sample_points(N_f: int, N_ic: int, device: str):
     # requires_grad=True is set directly at creation — this is more efficient
     # than creating the tensor first and then calling .requires_grad_(True).
     x_f = torch.rand(N_f,  1, dtype=torch.float64, device=device, requires_grad=True)
-    # Scale t_f to Uniform[0, T_END) BEFORE enabling requires_grad.
-    # Doing the multiplication after requires_grad=True would create an extra
-    # graph node that causes "backward through graph twice" errors.
-    t_f = (torch.rand(N_f, 1, dtype=torch.float64, device=device) * T_END).requires_grad_(True)
+    # Scale t_f to [0, T_END) with a quadratic bias BEFORE enabling requires_grad.
+    # Squaring a Uniform[0,1) draw gives PDF p(u) = 1/(2√u), which concentrates
+    # ~9× more samples near t=0 than near t=T_END.  This is critical because
+    # spinodal decomposition happens in a very narrow early window:
+    #   t* ≈ ln(1/IC_AMPLITUDE) / σ_max ≈ 0.01–0.03
+    # Uniform sampling over [0, 10] puts fewer than 0.3% of points there;
+    # quadratic bias puts ~17%, giving the network enough supervision to learn
+    # the rapid phase-separation dynamics before the slow coarsening regime.
+    u = torch.rand(N_f, 1, dtype=torch.float64, device=device)
+    t_f = (u ** 2 * T_END).requires_grad_(True)
 
     # Sample IC x-coordinates directly on device using torch.rand.
     # Previously this used np.random.uniform + torch.tensor(), which created
