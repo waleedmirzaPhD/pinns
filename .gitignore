@@ -1,0 +1,12 @@
+# Downloaded results and local test runs
+cahn_hilliard/results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+
+# Plots and outputs
+*.png
+*.pdf
