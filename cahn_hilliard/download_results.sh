@@ -6,7 +6,7 @@ set -euo pipefail
 
 REMOTE_USER="mirza"
 REMOTE_HOST="login1.cluster.embl.de"
-REMOTE_PASS="detemrinedE123$"
+REMOTE_PASS="determinedE123$"
 REMOTE_DIR="/g/torres-hd/mirza/other_projects/pinn_models"
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)/results"
 
