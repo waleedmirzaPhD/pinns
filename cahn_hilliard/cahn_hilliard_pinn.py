@@ -248,6 +248,42 @@ class PINN(nn.Module):
         # Apply Xavier uniform initialisation to all Linear layers.
         self._init_weights()
 
+        # -----------------------------------------------------------------------
+        # Pre-compute IC Fourier coefficients for the output transform.
+        #
+        # The network uses a hard IC enforcement:
+        #     c(x, t) = c_ic(x)  +  t * h(x, t)
+        # where h is the raw MLP output and c_ic is the exact initial condition.
+        # At t=0 this gives c(x,0) = c_ic(x) identically, so the IC loss is zero
+        # by construction and the network only needs to learn the dynamics.
+        #
+        # Without this, the trivial solution c≡0 (a fixed point of Cahn-Hilliard)
+        # dominates training: the PDE loss vanishes there while the IC loss
+        # (amplitude 0.05) is small enough that Adam never escapes the basin.
+        #
+        # We use the same seed (42) as ic_function() so that model.ic(x) and
+        # ic_function(x) agree exactly on any sample, making L_ic = 0 by design.
+        # The normalization is computed on a fine grid once at init so the scale
+        # factor is deterministic and does not vary with the runtime sample.
+        # -----------------------------------------------------------------------
+        rng = np.random.default_rng(42)
+        a   = rng.uniform(-1, 1, 3)   # cosine amplitudes for k = 1, 2, 3
+        b   = rng.uniform(-1, 1, 3)   # sine   amplitudes for k = 1, 2, 3
+
+        # Evaluate on a fine grid to get a stable max for normalisation.
+        x_fine = np.linspace(0, 1, 10_000, endpoint=False)
+        c_fine = np.zeros_like(x_fine)
+        for k in range(1, 4):
+            c_fine += a[k-1] * np.cos(2*np.pi*k*x_fine) \
+                    + b[k-1] * np.sin(2*np.pi*k*x_fine)
+        den   = np.max(np.abs(c_fine))
+        scale = 0.05 / den if den > 0 else 0.05   # normalise peak to 0.05
+
+        # Store as non-trainable buffers so they travel with the model to any device.
+        self.register_buffer('_ic_a', torch.tensor(a * scale, dtype=torch.float64))
+        self.register_buffer('_ic_b', torch.tensor(b * scale, dtype=torch.float64))
+        self.register_buffer('_ic_k', torch.tensor([1., 2., 3.], dtype=torch.float64))
+
     def _init_weights(self):
         """
         Initialise every Linear layer's weights with Xavier uniform and biases to zero.
@@ -263,19 +299,50 @@ class PINN(nn.Module):
                 nn.init.xavier_uniform_(m.weight) # Overwrite weight tensor in-place
                 nn.init.zeros_(m.bias)            # Start biases at exactly zero
 
+    def ic(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the exact initial condition c(x, 0) at spatial points x.
+
+        Uses the same Fourier coefficients computed at __init__ time (seed 42),
+        so model.ic(x) == ic_function(x) for any x, making L_ic identically zero.
+
+        Args:
+            x: shape (N, 1) — spatial coordinates in [0, 1)
+
+        Returns:
+            shape (N, 1) — initial condition values
+        """
+        kx = 2.0 * torch.pi * x * self._ic_k           # (N, 3) broadcast
+        return (self._ic_a * torch.cos(kx)
+              + self._ic_b * torch.sin(kx)).sum(dim=1, keepdim=True)  # (N, 1)
+
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        Evaluate the network at points (x, t).
+        Evaluate the network at points (x, t) with hard IC enforcement.
+
+        Output transform:
+            c(x, t) = c_ic(x)  +  t * h(x, t)
+
+        where h = MLP(FourierEmbedding(x, t)) is the learnable part.
+
+        Why this works:
+            • At t = 0: c = c_ic(x) + 0 = c_ic(x)  — IC exact by construction.
+            • For t > 0: c deviates from the IC as the PDE dynamics dictate.
+            • The network never needs to "discover" the IC from a soft penalty;
+              it only learns the temporal evolution h(x, t).
+            • Autograd differentiates through both c_ic(x) and t·h correctly,
+              so all spatial and temporal derivatives in pde_residual are exact.
 
         Args:
             x: shape (N, 1) — spatial coordinates
-            t: shape (N, 1) — time coordinates
+            t: shape (N, 1) — time coordinates (raw, in [0, T_END])
 
         Returns:
             c: shape (N, 1) — predicted phase-field value at each (x_i, t_i)
         """
-        phi = self.embed(x, t)  # Apply Fourier embedding → (N, 2K+1)
-        return self.net(phi)    # Pass through MLP → (N, 1)
+        phi = self.embed(x, t)       # Fourier embedding  → (N, 2K+1)
+        h   = self.net(phi)          # learnable dynamics → (N, 1)
+        return self.ic(x) + t * h   # hard IC enforcement
 
 
 # ===========================================================================
