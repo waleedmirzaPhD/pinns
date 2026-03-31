@@ -2,7 +2,7 @@
 Cahn-Hilliard PINN Solver — 1D Periodic Domain
 ================================================
 Solves: ∂c/∂t = ∂²/∂x² [ c³ - c - ε²∂²c/∂x² ]
-Domain: x ∈ [0,1) periodic, t ∈ [0,1], ε = 0.05
+Domain: x ∈ [0,1) periodic, t ∈ [0, T_END=2], ε = 0.05
 
 The Cahn-Hilliard equation models phase separation in binary mixtures
 (e.g. oil/water, alloy spinodal decomposition). The scalar field c(x,t)
@@ -49,14 +49,17 @@ torch.set_default_dtype(torch.float64)
 EPS = 0.05        # ε — interface width parameter in the Cahn-Hilliard equation.
                   # Smaller ε → sharper phase boundaries → harder to train.
 
-T_END = 10.0      # End time of the simulation window.
-                  # t ∈ [0, T_END]. Extending to 10 allows the system to move
-                  # through spinodal decomposition AND significant coarsening,
-                  # approaching a steady state of fully separated ±1 phases.
+T_END = 2.0       # End time of the simulation window.
+                  # t ∈ [0, T_END]. T_END=2 covers the full spinodal decomposition
+                  # (onset at t*≈0.01) plus early coarsening (t≈0.05–2), while
+                  # keeping the quadratic-sampled collocation points dense enough
+                  # in the critical early window.  With T_END=10 the 30k points
+                  # were spread too thin: P(t<0.05) drops from 16% (T_END=2) to
+                  # 7% (T_END=10), starving the phase-separation phase of data.
 
-N_F = 30_000      # Number of PDE collocation points scattered randomly in (x,t).
-                  # Increased from 10,000 to 30,000 to maintain adequate coverage
-                  # over the 10× larger time domain [0, T_END].
+N_F = 50_000      # Number of PDE collocation points scattered randomly in (x,t).
+                  # Increased to 50,000 to saturate the L40s GPU's float64 throughput
+                  # and ensure adequate coverage of the critical early-time window.
 
 N_IC = 2_000      # Number of points used to enforce the initial condition c(x,0).
                   # These live on the t=0 line only.
@@ -755,7 +758,7 @@ def train(model: PINN, device: str):
     # Phase 1: Adam
     # -----------------------------------------------------------------------
     print("=" * 60)
-    print("Phase 1: Adam optimiser (10,000 steps)")
+    print("Phase 1: Adam optimiser (30,000 steps)")
     print("=" * 60)
 
     model.train()
@@ -768,10 +771,11 @@ def train(model: PINN, device: str):
 
     # Cosine annealing smoothly reduces the learning rate from lr (1e-3) to
     # eta_min (1e-5) following a cosine curve over T_max steps.
-    # This avoids oscillating around the minimum at the end of Adam training.
-    scheduler = CosineAnnealingLR(optimizer, T_max=10_000, eta_min=1e-5)
+    # 30,000 steps gives 3× more Adam budget; the 4th-order PDE with rapid
+    # early dynamics needs more gradient steps than a 2nd-order problem.
+    scheduler = CosineAnnealingLR(optimizer, T_max=30_000, eta_min=1e-5)
 
-    for step in range(1, 10_001):   # steps 1 through 10,000 inclusive
+    for step in range(1, 30_001):   # steps 1 through 30,000 inclusive
 
         # Re-draw collocation points every 1,000 steps.
         # This is a form of Monte Carlo integration over (x,t) space —
@@ -862,7 +866,9 @@ def train(model: PINN, device: str):
     #                    Hessian approximation. 100 gives very accurate curvature.
     #   line_search_fn:  'strong_wolfe' ensures the Armijo and curvature
     #                    conditions are satisfied per step, giving robust convergence.
-    N_LBFGS = 10_000   # Total number of L-BFGS update steps (matches original max_iter intent)
+    N_LBFGS = 20_000   # Total number of L-BFGS update steps.
+                       # Doubled from 10k: with T_END=2 the loss surface is better
+                       # conditioned, so L-BFGS makes faster per-step progress.
 
     optimizer_lbfgs = torch.optim.LBFGS(
         model.parameters(),
@@ -914,7 +920,7 @@ def train(model: PINN, device: str):
             lt, lp, li = last_losses
 
             # Offset by Adam steps so the history x-axis is contiguous.
-            history['step'].append(10_000 + refine_step)
+            history['step'].append(30_000 + refine_step)
             history['total'].append(lt)
             history['pde'].append(lp)
             history['ic'].append(li)
@@ -1000,7 +1006,9 @@ def evaluate_and_plot(model: PINN, device: str):
     print("=" * 60)
 
     # Five snapshot times at which we will check the total mass.
-    snap_times = [0.0, T_END * 0.1, T_END * 0.25, T_END * 0.5, T_END * 0.75, T_END]
+    # Include t=0.01 and t=0.05 to capture the rapid phase-separation onset
+    # (t* ≈ 0.01) which falls inside the first 0.5% of T_END=2.
+    snap_times = [0.0, 0.01, 0.05, T_END * 0.25, T_END * 0.5, T_END]
     masses = []
 
     for t_star in snap_times:
@@ -1034,7 +1042,7 @@ def evaluate_and_plot(model: PINN, device: str):
         C,                  # 2-D array to display: rows = x, columns = t
         aspect='auto',      # Don't force square pixels; fill the axes box
         origin='lower',     # Place (x=0, t=0) at the bottom-left corner
-        extent=[0, 1, 0, 1],# Map pixel coordinates to actual (t, x) ranges
+        extent=[0, T_END, 0, 1], # t axis: [0, T_END]; x axis: [0, 1]
         cmap='RdBu_r',      # Red = positive (phase A), Blue = negative (phase B)
         vmin=-1, vmax=1,    # Fix colour scale to the physically meaningful range
     )
@@ -1148,7 +1156,9 @@ def plot_with_history(model: PINN, device: str, history: dict):
     print("Mass Conservation Check")
     print("=" * 60)
 
-    snap_times = [0.0, T_END * 0.1, T_END * 0.25, T_END * 0.5, T_END * 0.75, T_END]   # Diagnostic snapshot times
+    # Include t=0.01 and t=0.05 to capture the rapid phase-separation onset
+    # (t* ≈ 0.01) which falls inside the first 0.5% of T_END=2.
+    snap_times = [0.0, 0.01, 0.05, T_END * 0.25, T_END * 0.5, T_END]
     masses = []
 
     for t_star in snap_times:
@@ -1172,7 +1182,7 @@ def plot_with_history(model: PINN, device: str, history: dict):
         C,
         aspect='auto',       # Let matplotlib choose aspect ratio
         origin='lower',      # x=0 at bottom
-        extent=[0, 1, 0, 1], # Axis labels correspond to actual (t, x) values
+        extent=[0, T_END, 0, 1], # t axis: [0, T_END]; x axis: [0, 1]
         cmap='RdBu_r',       # Diverging colourmap centred at zero
         vmin=-1, vmax=1,     # Full physical range of c
     )
@@ -1206,10 +1216,10 @@ def plot_with_history(model: PINN, device: str, history: dict):
     ax.semilogy(steps, history['ic'],    'r:',  linewidth=1.2, label='L_ic')     # red dotted
 
     # Vertical line separates the two phases.  x-axis units change at this boundary.
-    ax.axvline(10_000, color='gray', linestyle=':', linewidth=1, label='Adam→L-BFGS')
+    ax.axvline(30_000, color='gray', linestyle=':', linewidth=1, label='Adam→L-BFGS')
 
     # Label explicitly reflects that the axis is not a uniform "step" count.
-    ax.set_xlabel('Adam step  |  L-BFGS closure call (offset +10 000)'); ax.set_ylabel('Loss')
+    ax.set_xlabel('Adam step  |  L-BFGS closure call (offset +30 000)'); ax.set_ylabel('Loss')
     ax.set_title('Loss curves (log scale)')
     ax.legend(fontsize=8)
 
@@ -1269,9 +1279,13 @@ def main():
     print(f"N_f = {N_F},  N_ic = {N_IC}\n")
 
     # Instantiate the PINN and move all parameters and buffers to the chosen device.
-    # Wider network (128 hidden units) to handle the richer dynamics over [0, T_END].
-    # The longer time window requires more representational capacity.
-    model = PINN(K=16, hidden_layers=5, hidden_dim=128).to(device)
+    #   K=32: 64 Fourier features (sin + cos up to k=32) gives spatial resolution
+    #         1/(2·32)=0.016, well below the interface width ε=0.05. K=16 gave
+    #         resolution 0.031, barely resolving the interface — insufficient for
+    #         accurate 4th-order autograd derivatives.
+    #   hidden_layers=5, hidden_dim=128: enough capacity for a 4th-order PDE
+    #         with sharp interfaces; input dim is now 2·32+1=65.
+    model = PINN(K=32, hidden_layers=5, hidden_dim=128).to(device)
 
     # Count and display the total number of trainable parameters.
     # sum(...) iterates over all parameter tensors; .numel() returns element count.
